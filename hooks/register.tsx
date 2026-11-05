@@ -1,18 +1,21 @@
 import { atom, read, update } from 'claude-code'
 import type { Register, SessionMeasureInput } from 'claude-code'
 
-import type { Figures, Limit } from '../types'
+import type { Figures, Limit, SharedLimits } from '../types'
 
 // Change the tag when Figures' fields change: it declines what an earlier
 // version stored, which outlives a reload.
 const figures = atom({ plugin: 'usage-meter', key: 'figures' } as const, null, {
-  shape: 'figures-1',
+  shape: 'figures-2',
 })
 
 const TICK_MS = 60_000
+const LIMITS_KEY = 'limits'
 const MINUTE = 60_000
 const HOUR = 60 * MINUTE
 const DAY = 24 * HOUR
+// A reading younger than this is current enough to go unlabelled.
+const STALE_MS = 5 * MINUTE
 
 type Measured = Pick<SessionMeasureInput, 'context' | 'rateLimits' | 'cost'>
 
@@ -31,11 +34,38 @@ function limitOf(measured: Measured, kind: string): Limit | null {
   }
 }
 
-function figuresOf(measured: Measured, now: number): Figures {
+function isLimit(value: unknown): value is Limit | null {
+  if (value === null) {
+    return true
+  }
+
+  const limit = value as Limit | undefined
+
+  return (
+    typeof limit === 'object' &&
+    typeof limit.percent === 'number' &&
+    (limit.resetsAt === null || typeof limit.resetsAt === 'number')
+  )
+}
+
+function isSharedLimits(value: unknown): value is SharedLimits {
+  const shared = value as SharedLimits | null | undefined
+
+  return (
+    typeof shared === 'object' &&
+    shared !== null &&
+    typeof shared.at === 'number' &&
+    isLimit(shared.fiveHour) &&
+    isLimit(shared.sevenDay)
+  )
+}
+
+function figuresOf(measured: Measured, now: number, shared: SharedLimits | null): Figures {
   return {
     now,
-    fiveHour: limitOf(measured, 'five_hour'),
-    sevenDay: limitOf(measured, 'seven_day'),
+    limitsAt: shared?.at ?? null,
+    fiveHour: shared ? shared.fiveHour : limitOf(measured, 'five_hour'),
+    sevenDay: shared ? shared.sevenDay : limitOf(measured, 'seven_day'),
     contextPercent: measured.context.percent ?? null,
     costUsd: measured.cost?.usd ?? null,
   }
@@ -104,8 +134,15 @@ export const register: Register = on => {
   on('session.start', async ($, e, next) => {
     const started = await next(e)
     const refresh = async () => {
-      const [usage, now] = await Promise.all([$.session.usage(), $.clock.now()])
-      await update($, figures, () => figuresOf(usage, now))
+      const [usage, now, stored] = await Promise.all([
+        $.session.usage(),
+        $.clock.now(),
+        $.store.get(LIMITS_KEY).catch(() => null),
+      ])
+      // Whichever session got a response last wrote the store, so it beats this
+      // session's own reading, and a new session has a figure before its first.
+      const shared = isSharedLimits(stored) ? stored : null
+      await update($, figures, () => figuresOf(usage, now, shared))
     }
 
     const logFailure = (err: unknown) => {
@@ -123,7 +160,20 @@ export const register: Register = on => {
 
   on('session.measure', async ($, e, next) => {
     const now = await $.clock.now()
-    await update($, figures, () => figuresOf(e, now))
+    const own = figuresOf(e, now, null)
+
+    if (own.fiveHour || own.sevenDay) {
+      const shared: SharedLimits = { at: now, fiveHour: own.fiveHour, sevenDay: own.sevenDay }
+      await update($, figures, () => ({ ...own, limitsAt: now }))
+      await $.store.set(LIMITS_KEY, shared).catch((err: unknown) => {
+        $.ui.log(`usage-meter: saving limits failed: ${err}`, { to: 'debug' })
+      })
+    } else {
+      // Off a response with no windows, keep what the sessions last shared.
+      const stored = await $.store.get(LIMITS_KEY).catch(() => null)
+      const shared = isSharedLimits(stored) ? stored : null
+      await update($, figures, () => figuresOf(e, now, shared))
+    }
 
     return next(e)
   })
@@ -186,10 +236,16 @@ export const register: Register = on => {
         : meter(label, limit.percent, left === null ? null : untilOf(left))
     }
 
+    const readingAge =
+      shown && shown.limitsAt !== null && (shown.fiveHour || shown.sevenDay)
+        ? shown.now - shown.limitsAt
+        : 0
+
     return (
       <Box flexWrap="wrap" columnGap={2} alignItems="center">
         {limitMeter('5時間', shown?.fiveHour)}
         {limitMeter('週次', shown?.sevenDay)}
+        {readingAge >= STALE_MS && <Text dimColor>({untilOf(readingAge)}前の値)</Text>}
         {meter('コンテキスト', shown?.contextPercent ?? null, null)}
         <Box flexShrink={0} flexDirection={direction} columnGap={1}>
           <Text dimColor>費用</Text>

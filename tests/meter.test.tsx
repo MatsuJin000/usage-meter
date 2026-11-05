@@ -37,6 +37,7 @@ const MEASURED: SessionMeasureInput = {
 
 test('every meter shows its figure, on both surfaces', async ($, on) => {
   on('clock.now', () => ({ value: NOW }))
+  mock.store(on)
   on('session.measure', (_, e) => ({ changed: e.changed }))
   await $.session.measure(MEASURED)
 
@@ -53,6 +54,7 @@ test('every meter shows its figure, on both surfaces', async ($, on) => {
 
 test('a window past its reset reads as started over', async ($, on) => {
   on('clock.now', () => ({ value: Date.parse('2026-11-05T03:00:00Z') }))
+  mock.store(on)
   on('session.measure', (_, e) => ({ changed: e.changed }))
   await $.session.measure(MEASURED)
 
@@ -86,6 +88,7 @@ test('a survey holding the band keeps the meters out of its way', async ($, on) 
 
 test('each window draws as a ring on the desktop, a glyph in the terminal', async ($, on) => {
   on('clock.now', () => ({ value: NOW }))
+  mock.store(on)
   on('session.measure', (_, e) => ({ changed: e.changed }))
   await $.session.measure(MEASURED)
 
@@ -108,6 +111,7 @@ const USAGE = { startedAt: NOW, context: { window: 200_000, percent: 45 }, rateL
 
 test('a first read that fails still starts the timer, and the log says so', async ($, on) => {
   const clock = mock.clock(on, { now: NOW })
+  mock.store(on)
   const logs: string[] = []
   let reads = 0
   on('session.start', (_, e) => ({ cwd: e.cwd }))
@@ -139,6 +143,7 @@ test('a first read that fails still starts the timer, and the log says so', asyn
 
 test('a failed tick is logged and the next one recovers', async ($, on) => {
   const clock = mock.clock(on, { now: NOW })
+  mock.store(on)
   const logs: string[] = []
   let reads = 0
   on('session.start', (_, e) => ({ cwd: e.cwd }))
@@ -168,6 +173,7 @@ test('a failed tick is logged and the next one recovers', async ($, on) => {
 
 test('color follows the percent as printed', async ($, on) => {
   on('clock.now', () => ({ value: NOW }))
+  mock.store(on)
   on('session.measure', (_, e) => ({ changed: e.changed }))
 
   const cases = [
@@ -194,6 +200,7 @@ test('color follows the percent as printed', async ($, on) => {
 
 test('only 0% reads as empty and only 100% as full', async ($, on) => {
   on('clock.now', () => ({ value: NOW }))
+  mock.store(on)
   on('session.measure', (_, e) => ({ changed: e.changed }))
 
   const cases = [
@@ -214,4 +221,66 @@ test('only 0% reads as empty and only 100% as full', async ($, on) => {
     expect((await ui.find({ type: 'Text', text: /^[○◔◑◕●]$/ }))?.text).toBe(glyph)
     await ui.unmount()
   }
+})
+
+const SHARED = {
+  at: NOW - 12 * 60_000,
+  fiveHour: { percent: 40, resetsAt: NOW + 3_600_000 },
+  sevenDay: { percent: 20, resetsAt: null },
+}
+
+test('a session opened midway shows what another session last read, with its age', async ($, on) => {
+  mock.clock(on, { now: NOW })
+  mock.store(on, { limits: SHARED })
+  on('session.start', (_, e) => ({ cwd: e.cwd }))
+  on('session.usage', () => ({ value: USAGE }))
+
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+
+  const ui = await $.ui.mount(BAND('terminal'))
+  for (const words of [/^40%$/, /^20%$/, /^\(12m前の値\)$/]) {
+    expect(await ui.find({ type: 'Text', text: words })).toBeDefined()
+  }
+  await ui.unmount()
+})
+
+test('a response here is shared, and a later one elsewhere reaches this session', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  let stored: unknown
+  on('store.get', () => ({ value: stored }))
+  on('store.set', (_, e) => {
+    stored = e.value
+
+    return { value: undefined }
+  })
+  on('session.start', (_, e) => ({ cwd: e.cwd }))
+  on('session.usage', () => ({ value: USAGE }))
+  on('session.measure', (_, e) => ({ changed: e.changed }))
+
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+  await $.session.measure(MEASURED)
+
+  expect(stored).toMatchObject({ at: NOW, fiveHour: { percent: 72.5 } })
+
+  stored = { ...SHARED, at: NOW + 30_000 }
+  await clock.advance(60_000)
+
+  const ui = await $.ui.mount(BAND('terminal'))
+  expect(await ui.find({ type: 'Text', text: /^40%$/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /前の値/ })).toBeUndefined()
+  await ui.unmount()
+})
+
+test('a stored value of the wrong shape is ignored', async ($, on) => {
+  mock.clock(on, { now: NOW })
+  mock.store(on, { limits: { at: 'soon', fiveHour: 7 } })
+  on('session.start', (_, e) => ({ cwd: e.cwd }))
+  on('session.usage', () => ({ value: USAGE }))
+
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+
+  const ui = await $.ui.mount(BAND('terminal'))
+  expect((await ui.find({ type: 'Text', text: /—/ }))?.text).toBe('—')
+  expect((await ui.find({ type: 'Text', text: /45%/ }))?.text).toBe('45%')
+  await ui.unmount()
 })
