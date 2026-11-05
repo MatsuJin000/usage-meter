@@ -1,0 +1,6 @@
+{
+  "name": "usage-meter",
+  "version": "0.1.0",
+  "description": "入力欄の上に5時間枠・週次枠・コンテキスト・費用のメーターを常時表示する",
+  "types": "./types/index.d.ts"
+}
