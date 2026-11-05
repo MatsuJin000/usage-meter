@@ -41,20 +41,25 @@ function figuresOf(measured: Measured, now: number): Figures {
   }
 }
 
-function colorOf(percent: number) {
-  if (percent >= 90) {
-    return 'error'
+// Colors follow the whole percent the meter prints, so 69.6, shown as 70%, is
+// already yellow.
+function levelOf(percent: number) {
+  const whole = Math.round(percent)
+
+  if (whole >= 90) {
+    return 'high'
   }
 
-  return percent >= 70 ? 'warning' : 'success'
+  return whole >= 70 ? 'mid' : 'low'
 }
 
-function hexOf(percent: number) {
-  if (percent >= 90) {
-    return '#e5534b'
-  }
+function colorOf(percent: number) {
+  return { low: 'success', mid: 'warning', high: 'error' }[levelOf(percent)]
+}
 
-  return percent >= 70 ? '#d9a03f' : '#3fa46a'
+// Each of these holds at least 3:1 on white and on a dark background.
+function hexOf(percent: number) {
+  return { low: '#2f9e5f', mid: '#b7791f', high: '#d9483f' }[levelOf(percent)]
 }
 
 // r is 100 / 2π, so the ring's length is 100 and a dash of n fills n percent.
@@ -65,15 +70,18 @@ function donutOf(percent: number) {
 
   return (
     `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 36 36">` +
-    `<circle ${ring} stroke="#8888884d"/>` +
+    `<circle ${ring} stroke="#88888899"/>` +
     `<circle ${ring} stroke="${hexOf(percent)}" stroke-dasharray="${filled} 100" ` +
     `transform="rotate(-90 18 18)"/></svg>`
   )
 }
 
-// The terminal has no Svg: the nearest quarter, as a glyph.
+// The terminal has no Svg: the nearest quarter, as a glyph. Only 0% reads as
+// empty and only 100% as full, so a window near either end doesn't look there.
 function glyphOf(percent: number) {
-  const quarters = Math.round(Math.min(100, Math.max(0, percent)) / 25)
+  const whole = Math.round(percent)
+  const quarters =
+    whole <= 0 ? 0 : whole >= 100 ? 4 : Math.min(3, Math.max(1, Math.round(whole / 25)))
 
   return ['○', '◔', '◑', '◕', '●'][quarters] ?? '○'
 }
@@ -100,10 +108,15 @@ export const register: Register = on => {
       await update($, figures, () => figuresOf(usage, now))
     }
 
-    await refresh()
+    const logFailure = (err: unknown) => {
+      $.ui.log(`usage-meter: reading usage failed: ${err}`, { to: 'debug' })
+    }
+
     // The minute tick keeps the countdowns moving while the session sits idle.
+    // It starts before the first read, so a failed read doesn't leave it unset.
     tick?.cancel()
-    tick = $.clock.every(TICK_MS, () => void refresh().catch(() => {}))
+    tick = $.clock.every(TICK_MS, () => void refresh().catch(logFailure))
+    await refresh().catch(logFailure)
 
     return started
   })
